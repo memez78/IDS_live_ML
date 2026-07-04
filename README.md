@@ -60,7 +60,7 @@ Full metrics, confusion matrices, and learning curves are in the notebook output
 
 ```
 .
-├── IDS_clean.ipynb      # full pipeline: feature extraction -> training -> evaluation
+├── IDS.ipynb      # full pipeline: feature extraction -> training -> evaluation
 ├── requirements.txt
 └── README.md
 ```
