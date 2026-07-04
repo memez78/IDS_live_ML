@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+Production-ready Live IDS implementation.
+
+This version is documented for maintainability and presentation.
+Implementation notes used during development have been removed.
+
 Live IDS Inference – FINAL PRODUCTION (v3 patches + AGGRESSIVE OVERRIDE)
 - Exact 59‑feature parity with notebook (order from feature_list.txt)
 - CV features (fwd_iat_cv, bwd_iat_cv, fwd_len_cv, bwd_len_cv, iat_cv)
@@ -11,37 +16,6 @@ Live IDS Inference – FINAL PRODUCTION (v3 patches + AGGRESSIVE OVERRIDE)
 - SQLi only if sqli_hard_flag == 1 or confidence >= 0.95
 - C2 low‑rate override (pkt_rate < 10, >=8 packets, no SQL keywords)
 - Temporal Correlation Engine + reset_state()
-
-FIXES applied (v2):
-  FIX-1  SYN early-exit now forces pred=SYN_Flood (was whatever model said)
-  FIX-2  Brute-Force override covers ALL predictions on BRUTE_FORCE_PORTS,
-         not just pred∈{3,5}; port list unified with BRUTE_FORCE_PORTS constant
-  FIX-3  TemporalCorrelationEngine gains reset_state() alias matching LiveIDS API;
-         LiveIDS.reset_state() now also resets flow_count / alert_count correctly
-  FIX-4  SQLi hard-flag sets conf_pass=True *before* other overrides can demote it,
-         and is re-checked on the *final* pred rather than the original pred
-  FIX-5  HTTP_Flood volumetric guard also fires when pred==4 (Brute_Force) on port 80
-         with no SQL evidence, preventing false Brute_Force on web floods
-
-FIXES applied (v3):
-  FIX-6  Mirror Port Bug: Override 1 (Brute_Force) now checks BOTH src_port and
-         dst_port against BRUTE_FORCE_PORTS. flow_key() uses an IP+port
-         lexicographic sort, so which port ends up as dst_port is unpredictable
-         when IPs differ in ordering. Without this, attacks from a high ephemeral
-         port (e.g. 55482) to a management port (e.g. 23) were silently missed.
-  FIX-7  Hot-path timeout reaping: _flush_timed_out() is now called at the top of
-         _packet_callback (immediately after the IP check) so zombie flows are
-         cleaned up before any new packet is processed. Previously it was only
-         called at the end, allowing flow table bloat during sustained attacks.
-  FIX-8  http_get_rate wired into Override 2: high GET rate on port 80 with no
-         SQL evidence is now an additional HTTP Flood signal. Previously the value
-         was computed in finalize_flow but never read by any override logic.
-
-AGGRESSIVE VOLUMETRIC GUARD (honest fix):
-  If port 80 is involved, packet rate > 100 pkt/s, the model predicts SQLi (5),
-  but there is no hard forensic SQL evidence (sqli_hard == 0), then force pred=2
-  (HTTP_Flood). This overrides the ML hallucination that benchmark tools like
-  ApacheBench are SQL injection attacks.
 """
 
 import os
@@ -74,7 +48,7 @@ SQLI_KEYWORD_HARD_THRESHOLD = 5
 MAX_TLS_PKTS = 10
 MAX_PAYLOADS = 20
 HTTP_PAYLOAD_PORTS = {80}
-# FIX-6: single source-of-truth; checked against BOTH ports in every flow
+
 BRUTE_FORCE_PORTS = {21, 22, 23, 25, 110, 139, 143, 445, 3306, 3389}
 
 # ------------------------------------------------------------
@@ -395,7 +369,7 @@ def finalize_flow(fid, flow):
         # Non-feature fields used only in overrides / display
         "src_ip": src,
         "dst_ip": dst,
-        "src_port": sport,       # FIX-6: exposed so Override 1 can check both ports
+        "src_port": sport,       # exposed so Override 1 can check both ports
         "total_pkts": tp,
         "sqli_hard_flag": sqli_feats["sqli_hard_flag"],
         "http_get_rate": http_get_rate,
@@ -576,7 +550,7 @@ class LiveIDS:
         row = finalize_flow(fid, flow)
         src_ip = row["src_ip"]
 
-        # ── FIX-1: SYN early-exit forces class, no ML needed ────────────────
+        # Fast path: flows identified as SYN-only attacks bypass the ML model.
         if force_syn_flood:
             cls_name = "SYN_Flood"
             conf = 1.0
@@ -609,14 +583,14 @@ class LiveIDS:
 
         # ── Extract forensic signals once for use in every override ──────────
         dst_port      = row.get("dst_port", 0)
-        src_port      = row.get("src_port", 0)           # FIX-6
-        all_ports     = {src_port, dst_port}              # FIX-6: bidirectional set
+        src_port      = row.get("src_port", 0)          
+        all_ports     = {src_port, dst_port}            
         pkt_rate      = row.get("pkt_rate", 0)
         sql_kw        = row.get("sql_keyword_count", 0)
         sqli_hard     = row.get("sqli_hard_flag", 0)
         syn_ratio     = row.get("syn_ratio", 0)
         total_pkts    = row.get("total_pkts", 0)
-        http_get_rate = row.get("http_get_rate", 0)       # FIX-8
+        http_get_rate = row.get("http_get_rate", 0)
         no_sql_evidence = (sql_kw == 0 and sqli_hard == 0)
 
         # =================================================================
@@ -624,7 +598,6 @@ class LiveIDS:
         # =================================================================
 
         # Override 1 – Brute Force on management/auth ports
-        # FIX-6: check BOTH ports in the flow. flow_key() sorts by (ip, port)
         # lexicographically, so when IPs differ the management port may end up
         # as either src_port or dst_port depending on IP ordering. Checking only
         # dst_port caused silent misses when Kali's high ephemeral port sorted
@@ -635,8 +608,6 @@ class LiveIDS:
             pred = 4   # Brute_Force
 
         # Override 2 – HTTP Flood volumetric guard (original)
-        # FIX-5: also fires when pred==4 (Brute_Force) to stop false positives.
-        # FIX-8: also fires on elevated http_get_rate even without high pkt_rate,
         #        catching slower GET floods that stay under the 50 pkt/s threshold.
         if dst_port in HTTP_PAYLOAD_PORTS and no_sql_evidence:
             if pkt_rate > 50 or http_get_rate > 30:
@@ -650,7 +621,7 @@ class LiveIDS:
 
         # Override 3 – SQLi hard-flag: DPI found real SQL in the payload.
         # Runs AFTER Override 1 so it can restore SQLi even if brute-force port
-        # logic demoted it (FIX-4).
+        # logic demoted it 
         if sqli_hard:
             pred = 5   # SQL_Injection
 
@@ -672,7 +643,7 @@ class LiveIDS:
         threshold = self.conf_thresh.get(cls_name, 0.75)
         conf_pass = (cls_name == "Normal") or (threshold is None) or (conf >= threshold)
 
-        # FIX-4: hard-flag overrides confidence gate on the *final* pred label
+
         if cls_name == "SQL_Injection" and sqli_hard:
             conf_pass = True
 
@@ -720,7 +691,7 @@ class LiveIDS:
         return (total_syn / denom) >= SYN_ONLY_RATIO_THRESHOLD
 
     def _packet_callback(self, pkt):
-        # FIX-7: reap timed-out flows BEFORE any processing to prevent flow table bloat
+        # reap timed-out flows BEFORE any processing to prevent flow table bloat
         self._flush_timed_out()
 
         if IP not in pkt:
@@ -743,7 +714,7 @@ class LiveIDS:
         flow = self.active_flows[key]
         total_pkts = flow["fwd_pkts"] + flow["bwd_pkts"]
 
-        # FIX-1: SYN-only early exit forces SYN_Flood, bypasses ML entirely.
+        # SYN-only early exit forces SYN_Flood, bypasses ML entirely.
         if TCP in pkt and self._is_syn_only_flow(flow):
             result = self._predict_flow(key, self.active_flows.pop(key),
                                         force_syn_flood=True)
